@@ -30,7 +30,8 @@
         {
           "backgroundColor": "#FFFFFF"
         }
-      ]
+      ],
+      "expo-sharing"
     ],
     "experiments": {
       "typedRoutes": true,

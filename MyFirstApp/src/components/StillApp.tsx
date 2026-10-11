@@ -1,4 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as DocumentPicker from 'expo-document-picker';
+import { File, Paths } from 'expo-file-system';
+import * as Sharing from 'expo-sharing';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
@@ -25,10 +28,29 @@ import {
 import type {
   Priority,
   PriorityFilter,
+  CompletionEvent,
+  ProductivityStatistics,
+  RecurrenceRule,
+  StillBackup,
   Task,
+  TaskStore,
   TaskStatusFilter,
   ThemePreference,
+  Weekday,
 } from '@/types/task';
+import {
+  addDays,
+  calculateStatistics,
+  createBackup,
+  dateLabel,
+  formatDate,
+  mergeTaskStores,
+  nextOccurrenceDate,
+  parseDate,
+  readTaskStore,
+  serializeTaskStore,
+  validateBackup,
+} from '@/lib/taskData';
 
 const pages = [
   {
@@ -84,76 +106,14 @@ const palettes = {
 
 type Palette = (typeof palettes)[keyof typeof palettes];
 
-function formatDate(date: Date) {
-  const year = date.getFullYear();
-  const month = `${date.getMonth() + 1}`.padStart(2, '0');
-  const day = `${date.getDate()}`.padStart(2, '0');
-  return `${year}-${month}-${day}`;
-}
+const weekdayLabels = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'] as const;
+const weekdayOrder: Weekday[] = [0, 1, 2, 3, 4, 5, 6];
 
-function parseDate(value: string) {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
-  const [year, month, day] = value.split('-').map(Number);
-  const date = new Date(year, month - 1, day);
-  if (
-    date.getFullYear() !== year ||
-    date.getMonth() !== month - 1 ||
-    date.getDate() !== day
-  ) {
-    return null;
-  }
-  return date;
-}
-
-function dateLabel(value: string) {
-  const date = parseDate(value);
-  if (!date) return value;
-  const today = formatDate(new Date());
-  const tomorrowDate = new Date();
-  tomorrowDate.setDate(tomorrowDate.getDate() + 1);
-  if (value === today) return 'Today';
-  if (value === formatDate(tomorrowDate)) return 'Tomorrow';
-  return date.toLocaleDateString(undefined, {
-    month: 'short',
-    day: 'numeric',
-    year: date.getFullYear() === new Date().getFullYear() ? undefined : 'numeric',
-  });
-}
-
-function isPriority(value: unknown): value is Priority {
-  return value === 'low' || value === 'medium' || value === 'high';
-}
-
-function readTasks(value: string | null): Task[] {
-  if (!value) return [];
-  const parsed: unknown = JSON.parse(value);
-  if (!Array.isArray(parsed)) {
-    throw new Error('Saved task data is not a list.');
-  }
-
-  const validTasks = parsed.filter((item): item is Task => {
-    if (!item || typeof item !== 'object') return false;
-    const candidate = item as Record<string, unknown>;
-    return (
-      typeof candidate.id === 'string' &&
-      typeof candidate.title === 'string' &&
-      typeof candidate.description === 'string' &&
-      (candidate.dueDate === null ||
-        (typeof candidate.dueDate === 'string' &&
-          parseDate(candidate.dueDate) !== null)) &&
-      isPriority(candidate.priority) &&
-      typeof candidate.completed === 'boolean' &&
-      typeof candidate.createdAt === 'string'
-    );
-  });
-
-  if (validTasks.length !== parsed.length) {
-    Alert.alert(
-      'Some tasks could not be restored',
-      'A few saved entries were incomplete or invalid and were left out.',
-    );
-  }
-  return validTasks;
+function recurrenceLabel(rule: RecurrenceRule | null | undefined): string | null {
+  if (!rule) return null;
+  if (rule.type === 'daily') return 'Daily';
+  if (rule.type === 'weekly') return 'Weekly';
+  return rule.days.map(day => weekdayLabels[day]).join(', ');
 }
 
 function showStorageError(action: string, error: unknown) {
@@ -268,6 +228,12 @@ function TaskRow({
       : task.priority === 'medium'
         ? palette.secondary
         : palette.muted;
+  const dueLabel = task.dueDate
+    ? !task.completed && task.dueDate < formatDate(new Date())
+      ? 'Overdue'
+      : dateLabel(task.dueDate)
+    : 'No date';
+  const repeatLabel = recurrenceLabel(task.recurrence);
   return (
     <View style={[styles.taskRow, { borderBottomColor: palette.border }]}>
       <Pressable
@@ -316,12 +282,20 @@ function TaskRow({
         )}
         <View style={styles.taskMeta}>
           <Text style={[styles.taskMetaText, { color: palette.secondary }]}>
-            {task.dueDate ? dateLabel(task.dueDate) : 'No date'}
+            {dueLabel}
           </Text>
           <View style={[styles.metaDot, { backgroundColor: palette.muted }]} />
           <Text style={[styles.taskMetaText, { color: priorityColor }]}>
             {task.priority}
           </Text>
+          {repeatLabel && (
+            <>
+              <View style={[styles.metaDot, { backgroundColor: palette.muted }]} />
+              <Text style={[styles.taskMetaText, { color: palette.secondary }]}>
+                {repeatLabel}
+              </Text>
+            </>
+          )}
         </View>
       </Pressable>
 
@@ -342,12 +316,15 @@ export default function StillApp() {
   const [ready, setReady] = useState(false);
   const [onboarded, setOnboarded] = useState(false);
   const [page, setPage] = useState(0);
+  const [today, setToday] = useState(() => formatDate(new Date()));
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [completionHistory, setCompletionHistory] = useState<CompletionEvent[]>([]);
   const [themePreference, setThemePreference] = useState<ThemePreference>('system');
-  const [tab, setTab] = useState<'tasks' | 'settings'>('tasks');
+  const [tab, setTab] = useState<'tasks' | 'calendar' | 'statistics' | 'settings'>('tasks');
   const [statusFilter, setStatusFilter] = useState<TaskStatusFilter>('all');
   const [priorityFilter, setPriorityFilter] = useState<PriorityFilter>('all');
   const [search, setSearch] = useState('');
+  const [selectedCalendarDate, setSelectedCalendarDate] = useState(formatDate(new Date()));
   const [modalVisible, setModalVisible] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [titleDraft, setTitleDraft] = useState('');
@@ -355,16 +332,27 @@ export default function StillApp() {
   const [selectedDate, setSelectedDate] = useState<string | null>(formatDate(new Date()));
   const [customDateDraft, setCustomDateDraft] = useState('');
   const [priorityDraft, setPriorityDraft] = useState<Priority>('medium');
+  const [recurrenceDraft, setRecurrenceDraft] = useState<RecurrenceRule | null>(null);
+  const [taskStorageWritable, setTaskStorageWritable] = useState(true);
   const tasksDirty = useRef(false);
+  const preservedTasks = useRef<unknown[]>([]);
+  const persistQueue = useRef<Promise<void>>(Promise.resolve());
 
   const colorScheme = useColorScheme();
   const effectiveTheme =
     themePreference === 'system' ? (colorScheme === 'dark' ? 'dark' : 'light') : themePreference;
   const palette = palettes[effectiveTheme];
-  const today = formatDate(new Date());
   const tomorrow = new Date();
   tomorrow.setDate(tomorrow.getDate() + 1);
   const tomorrowValue = formatDate(tomorrow);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const currentDate = formatDate(new Date());
+      setToday(previous => (previous === currentDate ? previous : currentDate));
+    }, 60_000);
+    return () => clearInterval(interval);
+  }, []);
 
   useEffect(() => {
     async function loadSavedData() {
@@ -375,18 +363,28 @@ export default function StillApp() {
           THEME_STORAGE_KEY,
         ]);
         const saved = new Map(savedValues);
-        setTasks(readTasks(saved.get(TASKS_STORAGE_KEY) ?? null));
         setOnboarded(saved.get(ONBOARDING_STORAGE_KEY) === 'yes');
         const savedTheme = saved.get(THEME_STORAGE_KEY);
         if (savedTheme === 'light' || savedTheme === 'dark' || savedTheme === 'system') {
           setThemePreference(savedTheme);
         }
+        const taskStore = readTaskStore(saved.get(TASKS_STORAGE_KEY) ?? null);
+        setTasks(taskStore.tasks);
+        setCompletionHistory(taskStore.completionHistory);
+        preservedTasks.current = taskStore.preservedTasks ?? [];
+        if (preservedTasks.current.length) {
+          Alert.alert(
+            'Some saved tasks could not be shown',
+            'Those entries are being kept in local storage while the readable tasks remain available.',
+          );
+        }
       } catch (error) {
         console.error('Still could not load saved data.', error);
         Alert.alert(
           'Could not load saved data',
-          'Still will open with an empty task list. Your existing saved data has not been intentionally cleared.',
+          'Still could not safely read the saved task list. The original data has not been overwritten, and task changes are disabled until you restore a valid backup.',
         );
+        setTaskStorageWritable(false);
       } finally {
         setReady(true);
       }
@@ -395,12 +393,20 @@ export default function StillApp() {
   }, []);
 
   useEffect(() => {
-    if (!ready || !tasksDirty.current) return;
+    if (!ready || !tasksDirty.current || !taskStorageWritable) return;
     tasksDirty.current = false;
-    void AsyncStorage.setItem(TASKS_STORAGE_KEY, JSON.stringify(tasks)).catch(error =>
-      showStorageError('save your tasks', error),
-    );
-  }, [ready, tasks]);
+    const store: TaskStore = {
+      version: 2,
+      tasks,
+      completionHistory,
+      ...(preservedTasks.current.length
+        ? { preservedTasks: preservedTasks.current }
+        : {}),
+    };
+    persistQueue.current = persistQueue.current
+      .then(() => AsyncStorage.setItem(TASKS_STORAGE_KEY, serializeTaskStore(store)))
+      .catch(error => showStorageError('save your tasks', error));
+  }, [completionHistory, ready, taskStorageWritable, tasks]);
 
   async function updatePreference(key: string, value: string, action: string) {
     try {
@@ -429,17 +435,29 @@ export default function StillApp() {
     setOnboarded(false);
   }
 
+  function ensureTaskStorageWritable() {
+    if (taskStorageWritable) return true;
+    Alert.alert(
+      'Tasks are read-only',
+      'Saved task data could not be read safely. Restore a valid Still backup before making task changes.',
+    );
+    return false;
+  }
+
   function openNewTask() {
+    if (!ensureTaskStorageWritable()) return;
     setEditingId(null);
     setTitleDraft('');
     setDescriptionDraft('');
     setSelectedDate(today);
     setCustomDateDraft('');
     setPriorityDraft('medium');
+    setRecurrenceDraft(null);
     setModalVisible(true);
   }
 
   function openEditTask(task: Task) {
+    if (!ensureTaskStorageWritable()) return;
     setEditingId(task.id);
     setTitleDraft(task.title);
     setDescriptionDraft(task.description);
@@ -450,10 +468,12 @@ export default function StillApp() {
         : '',
     );
     setPriorityDraft(task.priority);
+    setRecurrenceDraft(task.recurrence ?? null);
     setModalVisible(true);
   }
 
   function saveTask() {
+    if (!ensureTaskStorageWritable()) return;
     const cleanTitle = titleDraft.trim();
     if (!cleanTitle) {
       Alert.alert('A title is needed', 'Enter a task name before saving.');
@@ -472,7 +492,17 @@ export default function StillApp() {
       setTasks(current =>
         current.map(task =>
           task.id === editingId
-            ? { ...task, title: cleanTitle, description, dueDate, priority: priorityDraft }
+            ? {
+                ...task,
+                title: cleanTitle,
+                description,
+                dueDate,
+                priority: priorityDraft,
+                recurrence: recurrenceDraft,
+                ...(!task.recurrence && recurrenceDraft
+                  ? { completed: false, completedAt: null }
+                  : {}),
+              }
             : task,
         ),
       );
@@ -485,6 +515,8 @@ export default function StillApp() {
         priority: priorityDraft,
         completed: false,
         createdAt: new Date().toISOString(),
+        recurrence: recurrenceDraft,
+        completedAt: null,
       };
       setTasks(current => [newTask, ...current]);
     }
@@ -493,15 +525,74 @@ export default function StillApp() {
   }
 
   function toggleTask(id: string) {
-    setTasks(current =>
-      current.map(task =>
-        task.id === id ? { ...task, completed: !task.completed } : task,
-      ),
-    );
+    if (!ensureTaskStorageWritable()) return;
+    const task = tasks.find(item => item.id === id);
+    if (!task) return;
+    if (task.completed) {
+      setTasks(current =>
+        current.map(item =>
+          item.id === id ? { ...item, completed: false, completedAt: null } : item,
+        ),
+      );
+    } else {
+      const completedAt = new Date().toISOString();
+      const occurrenceDate = task.dueDate ?? today;
+      const recurring = task.recurrence !== null && task.recurrence !== undefined;
+      const event: CompletionEvent = {
+        id: recurring
+          ? `repeat:${task.id}:${occurrenceDate}`
+          : `once:${task.id}:${completedAt}:${Math.random().toString(36).slice(2)}`,
+        taskId: task.id,
+        title: task.title,
+        occurrenceDate,
+        completionDate: today,
+        completedAt,
+        recurring,
+      };
+      const recurrence = task.recurrence;
+      setCompletionHistory(current => {
+        if (
+          current.some(
+            item =>
+              item.id === event.id ||
+              (recurring &&
+                item.recurring &&
+                item.taskId === task.id &&
+                item.occurrenceDate === occurrenceDate),
+          )
+        ) {
+          return current;
+        }
+        return [...current, event];
+      });
+      if (recurrence) {
+        setTasks(current =>
+          current.map(item =>
+            item.id === id
+              ? {
+                  ...item,
+                  dueDate: nextOccurrenceDate(task.dueDate, recurrence, today),
+                  completed: false,
+                  completedAt: null,
+                }
+              : item,
+          ),
+        );
+      } else {
+        setTasks(current =>
+          current.map(item =>
+            item.id === id
+              ? { ...item, completed: true, completedAt }
+              : item,
+          ),
+        );
+      }
+    }
     tasksDirty.current = true;
   }
 
   function confirmDelete(task: Task) {
+    if (!ensureTaskStorageWritable()) return;
     Alert.alert('Delete this task?', `"${task.title}" will be removed from Still.`, [
       { text: 'Cancel', style: 'cancel' },
       {
@@ -522,8 +613,224 @@ export default function StillApp() {
     setThemePreference(value);
   }
 
+  function currentTaskStore(): TaskStore {
+    return {
+      version: 2,
+      tasks,
+      completionHistory,
+      ...(preservedTasks.current.length
+        ? { preservedTasks: preservedTasks.current }
+        : {}),
+    };
+  }
+
+  async function exportBackup(): Promise<boolean> {
+    try {
+      if (!taskStorageWritable) {
+        throw new Error(
+          'Still could not read the saved tasks. No backup was created so unreadable data is not mistaken for an empty list.',
+        );
+      }
+      const backup = createBackup(
+        currentTaskStore(),
+        themePreference,
+        onboarded,
+      );
+      const fileName = `still-backup-${Date.now()}.json`;
+      const content = `${JSON.stringify(backup, null, 2)}\n`;
+      if (Platform.OS === 'web') {
+        const url = URL.createObjectURL(
+          new Blob([content], { type: 'application/json' }),
+        );
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = fileName;
+        link.style.display = 'none';
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        Alert.alert('Backup ready', 'Still downloaded a local JSON backup file.');
+        return true;
+      }
+      const file = new File(Paths.cache, fileName);
+      file.write(content);
+      if (!(await Sharing.isAvailableAsync())) {
+        throw new Error('File sharing is not available on this device or browser.');
+      }
+      await Sharing.shareAsync(file.uri, {
+        mimeType: 'application/json',
+        dialogTitle: 'Export Still backup',
+      });
+      Alert.alert(
+        'Backup ready',
+        'Still prepared a local JSON backup. Save or share it from the system sheet to keep a copy.',
+      );
+      return true;
+    } catch (error) {
+      console.error('Still could not export a backup.', error);
+      Alert.alert(
+        'Could not export backup',
+        error instanceof Error
+          ? error.message
+          : 'Still could not create or share the backup file.',
+      );
+      return false;
+    }
+  }
+
+  async function restoreBackup(backup: StillBackup, mode: 'merge' | 'replace') {
+    const current = currentTaskStore();
+    const nextStore =
+      mode === 'merge'
+        ? mergeTaskStores(current, backup)
+        : {
+            version: 2 as const,
+            tasks: backup.tasks,
+            completionHistory: backup.completionHistory,
+            ...(backup.preservedTasks?.length
+              ? { preservedTasks: backup.preservedTasks }
+              : {}),
+          };
+    const values: [string, string][] = [
+      [TASKS_STORAGE_KEY, serializeTaskStore(nextStore)],
+    ];
+    if (mode === 'replace') {
+      values.push(
+        [THEME_STORAGE_KEY, backup.preferences.themePreference],
+        [ONBOARDING_STORAGE_KEY, backup.preferences.onboarded ? 'yes' : 'no'],
+      );
+    }
+    const write = persistQueue.current.then(() => AsyncStorage.multiSet(values));
+    persistQueue.current = write.catch(error => {
+      console.error('Still could not restore the backup.', error);
+      Alert.alert(
+        'Could not restore backup',
+        'Still could not save the selected backup. The in-memory data was not replaced.',
+      );
+    });
+    try {
+      await write;
+    } catch {
+      return;
+    }
+    preservedTasks.current = nextStore.preservedTasks ?? [];
+    tasksDirty.current = false;
+    setTaskStorageWritable(true);
+    setTasks(nextStore.tasks);
+    setCompletionHistory(nextStore.completionHistory);
+    if (mode === 'replace') {
+      setThemePreference(backup.preferences.themePreference);
+      setOnboarded(backup.preferences.onboarded);
+    }
+    Alert.alert(
+      'Backup restored',
+      mode === 'merge'
+        ? 'Tasks with new IDs and any new completion events were added. Existing tasks and preferences were kept.'
+        : 'The backup replaced the local tasks, completion history, and preferences.',
+    );
+  }
+
+  async function pickBackupToRestore() {
+    try {
+      const result = await DocumentPicker.getDocumentAsync({
+        type: ['application/json', 'text/json'],
+        copyToCacheDirectory: true,
+        multiple: false,
+        base64: false,
+      });
+      if (result.canceled || !result.assets.length) return;
+      const selected = result.assets[0];
+      const content =
+        Platform.OS === 'web'
+          ? await selected.file?.text()
+          : new File(selected.uri).textSync();
+      if (content === undefined) {
+        throw new Error('The selected file could not be read.');
+      }
+      const backup = validateBackup(JSON.parse(content) as unknown);
+      if (!taskStorageWritable) {
+        Alert.alert(
+          'Saved data could not be read',
+          'Still cannot safely merge with the current task data. Replacing it will overwrite the unreadable local value.',
+          [
+            { text: 'Cancel', style: 'cancel' },
+            {
+              text: 'Replace',
+              style: 'destructive',
+              onPress: () => void restoreBackup(backup, 'replace'),
+            },
+          ],
+        );
+        return;
+      }
+      Alert.alert(
+        'Restore this backup?',
+        'Choose how to combine its tasks, recurrence rules, completion history, and preferences with this device.',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          {
+            text: 'Merge',
+            onPress: () => void restoreBackup(backup, 'merge'),
+          },
+          {
+            text: 'Replace…',
+            style: 'destructive',
+            onPress: () => {
+              Alert.alert(
+                'Replace local data?',
+                'This replaces all local tasks and completion history. Export a copy of the current data first if you may need it later.',
+                [
+                  { text: 'Cancel', style: 'cancel' },
+                  {
+                    text: 'Export first',
+                    onPress: () => {
+                      void (async () => {
+                        if (await exportBackup()) {
+                          Alert.alert(
+                            'Confirm replacement',
+                            'Your current data has been offered for export. Replace it with the selected backup?',
+                            [
+                              { text: 'Cancel', style: 'cancel' },
+                              {
+                                text: 'Replace',
+                                style: 'destructive',
+                                onPress: () => void restoreBackup(backup, 'replace'),
+                              },
+                            ],
+                          );
+                        }
+                      })();
+                    },
+                  },
+                  {
+                    text: 'Replace anyway',
+                    style: 'destructive',
+                    onPress: () => void restoreBackup(backup, 'replace'),
+                  },
+                ],
+              );
+            },
+          },
+        ],
+      );
+    } catch (error) {
+      console.error('Still could not read a backup file.', error);
+      Alert.alert(
+        'Could not restore backup',
+        error instanceof Error
+          ? error.message
+          : 'Still could not read that file. Choose a valid Still JSON backup.',
+      );
+    }
+  }
+
   const activeCount = tasks.filter(task => !task.completed).length;
   const completedCount = tasks.length - activeCount;
+  const statistics = useMemo(
+    () => calculateStatistics(tasks, completionHistory, today),
+    [completionHistory, tasks, today],
+  );
   const matchingTasks = useMemo(() => {
     const query = search.trim().toLocaleLowerCase();
     return tasks.filter(task => {
@@ -620,7 +927,10 @@ export default function StillApp() {
   }
 
   const todayTasks = matchingTasks.filter(
-    task => !task.completed && (!task.dueDate || task.dueDate <= today),
+    task => !task.completed && (!task.dueDate || task.dueDate === today),
+  );
+  const overdueTasks = matchingTasks.filter(
+    task => !task.completed && task.dueDate !== null && task.dueDate < today,
   );
   const upcomingTasks = matchingTasks.filter(
     task => !task.completed && task.dueDate !== null && task.dueDate > today,
@@ -632,6 +942,9 @@ export default function StillApp() {
   const showUpcoming = statusFilter !== 'completed';
   const showCompleted = statusFilter !== 'active';
   const progress = tasks.length ? completedCount / tasks.length : 0;
+  const widgetTasks = tasks.filter(
+    task => !task.completed && (!task.dueDate || task.dueDate === today),
+  );
 
   return (
     <SafeAreaView style={[styles.safeArea, { backgroundColor: palette.background }]}>
@@ -684,6 +997,46 @@ export default function StillApp() {
                     ]}
                   />
                 </View>
+              </View>
+
+              <View
+                style={[
+                  styles.widgetPreview,
+                  { backgroundColor: palette.surface, borderColor: palette.border },
+                ]}
+                accessibilityLabel={`In-app widget preview. ${widgetTasks.length} tasks for today.`}
+              >
+                <View style={styles.widgetPreviewTop}>
+                  <View>
+                    <Text style={[styles.widgetPreviewEyebrow, { color: palette.secondary }]}>
+                      WIDGET PREVIEW · IN APP
+                    </Text>
+                    <Text style={[styles.widgetPreviewTitle, { color: palette.text }]}>
+                      Today
+                    </Text>
+                  </View>
+                  <Text style={[styles.widgetPreviewCount, { color: palette.text }]}>
+                    {widgetTasks.length}
+                  </Text>
+                </View>
+                {widgetTasks.length ? (
+                  widgetTasks.slice(0, 3).map(task => (
+                    <Text
+                      key={task.id}
+                      numberOfLines={1}
+                      style={[styles.widgetPreviewTask, { color: palette.secondary }]}
+                    >
+                      □  {task.title}
+                    </Text>
+                  ))
+                ) : (
+                  <Text style={[styles.widgetPreviewTask, { color: palette.muted }]}>
+                    No incomplete tasks for today.
+                  </Text>
+                )}
+                <Text style={[styles.widgetPreviewNote, { color: palette.muted }]}>
+                  Preview only · not an OS home-screen widget
+                </Text>
               </View>
 
               <Pressable
@@ -795,6 +1148,17 @@ export default function StillApp() {
                 <>
                   {showToday && (
                     <TaskSection
+                      title="Overdue"
+                      tasks={overdueTasks}
+                      palette={palette}
+                      onToggle={toggleTask}
+                      onEdit={openEditTask}
+                      onDelete={confirmDelete}
+                      emptyText="Nothing overdue."
+                    />
+                  )}
+                  {showToday && (
+                    <TaskSection
                       title="Today"
                       tasks={todayTasks}
                       palette={palette}
@@ -841,12 +1205,32 @@ export default function StillApp() {
               </View>
             </ScrollView>
           </>
+        ) : tab === 'calendar' ? (
+          <CalendarScreen
+            tasks={tasks}
+            completionHistory={completionHistory}
+            selectedDate={selectedCalendarDate}
+            today={today}
+            palette={palette}
+            onDateChange={setSelectedCalendarDate}
+            onToggle={toggleTask}
+            onEdit={openEditTask}
+            onDelete={confirmDelete}
+          />
+        ) : tab === 'statistics' ? (
+          <StatisticsScreen
+            statistics={statistics}
+            hasHistory={completionHistory.length > 0}
+            palette={palette}
+          />
         ) : (
           <SettingsScreen
             palette={palette}
             themePreference={themePreference}
             onThemeChange={changeTheme}
             onReplayOnboarding={replayOnboarding}
+            onExportBackup={() => void exportBackup()}
+            onRestoreBackup={() => void pickBackupToRestore()}
           />
         )}
 
@@ -857,6 +1241,20 @@ export default function StillApp() {
             selected={tab === 'tasks'}
             palette={palette}
             onPress={() => setTab('tasks')}
+          />
+          <TabButton
+            label="Calendar"
+            mark="▦"
+            selected={tab === 'calendar'}
+            palette={palette}
+            onPress={() => setTab('calendar')}
+          />
+          <TabButton
+            label="Stats"
+            mark="↗"
+            selected={tab === 'statistics'}
+            palette={palette}
+            onPress={() => setTab('statistics')}
           />
           <TabButton
             label="Settings"
@@ -876,6 +1274,7 @@ export default function StillApp() {
         selectedDate={selectedDate}
         customDate={customDateDraft}
         priority={priorityDraft}
+        recurrence={recurrenceDraft}
         palette={palette}
         onChangeTitle={setTitleDraft}
         onChangeDescription={setDescriptionDraft}
@@ -888,6 +1287,7 @@ export default function StillApp() {
           setSelectedDate(null);
         }}
         onSelectPriority={setPriorityDraft}
+        onSelectRecurrence={setRecurrenceDraft}
         onSave={saveTask}
         onClose={() => setModalVisible(false)}
       />
@@ -969,6 +1369,318 @@ function TaskSection({
   );
 }
 
+function CalendarScreen({
+  tasks,
+  completionHistory,
+  selectedDate,
+  today,
+  palette,
+  onDateChange,
+  onToggle,
+  onEdit,
+  onDelete,
+}: {
+  tasks: Task[];
+  completionHistory: CompletionEvent[];
+  selectedDate: string;
+  today: string;
+  palette: Palette;
+  onDateChange: (value: string) => void;
+  onToggle: (id: string) => void;
+  onEdit: (task: Task) => void;
+  onDelete: (task: Task) => void;
+}) {
+  const selected = parseDate(selectedDate) ?? new Date();
+  const mondayOffset = (selected.getDay() + 6) % 7;
+  const weekStart = parseDate(addDays(selectedDate, -mondayOffset)) ?? selected;
+  const week = Array.from({ length: 7 }, (_, index) => {
+    const day = new Date(weekStart);
+    day.setDate(day.getDate() + index);
+    return day;
+  });
+  const events = completionHistory.filter(
+    event => event.occurrenceDate === selectedDate,
+  );
+  const eventTaskIds = new Set(events.map(event => event.taskId));
+  const datedTasks = tasks.filter(
+    task =>
+      task.dueDate === selectedDate &&
+      !(task.completed && eventTaskIds.has(task.id)),
+  );
+
+  return (
+    <>
+      <View style={[styles.topBar, { borderBottomColor: palette.border }]}>
+        <Text style={[styles.wordmark, { color: palette.text }]}>{APP_NAME}</Text>
+        <Text style={[styles.topBarLabel, { color: palette.secondary }]}>AGENDA</Text>
+      </View>
+      <ScrollView
+        contentContainerStyle={styles.calendarContent}
+        showsVerticalScrollIndicator={false}
+      >
+        <Text style={[styles.dateText, { color: palette.secondary }]}>
+          PLAN AHEAD
+        </Text>
+        <Text style={[styles.pageTitle, { color: palette.text }]}>Calendar</Text>
+        <Text style={[styles.pageSubtitle, { color: palette.secondary }]}>
+          A simple agenda of dated tasks and completed occurrences.
+        </Text>
+
+        <View style={styles.calendarControls}>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Previous week"
+            onPress={() => onDateChange(addDays(selectedDate, -7))}
+            style={[styles.calendarArrow, { borderColor: palette.border }]}
+          >
+            <Text style={[styles.calendarArrowText, { color: palette.text }]}>‹</Text>
+          </Pressable>
+          <Text style={[styles.calendarMonth, { color: palette.text }]}>
+            {selected.toLocaleDateString(undefined, { month: 'long', year: 'numeric' })}
+          </Text>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Next week"
+            onPress={() => onDateChange(addDays(selectedDate, 7))}
+            style={[styles.calendarArrow, { borderColor: palette.border }]}
+          >
+            <Text style={[styles.calendarArrowText, { color: palette.text }]}>›</Text>
+          </Pressable>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Go to today"
+            onPress={() => onDateChange(today)}
+            style={[styles.todayButton, { borderColor: palette.border }]}
+          >
+            <Text style={[styles.todayButtonText, { color: palette.secondary }]}>
+              Today
+            </Text>
+          </Pressable>
+        </View>
+
+        <View style={styles.calendarWeek}>
+          {week.map(day => {
+            const value = formatDate(day);
+            const isSelected = value === selectedDate;
+            return (
+              <Pressable
+                key={value}
+                accessibilityRole="button"
+                accessibilityLabel={day.toLocaleDateString(undefined, {
+                  weekday: 'long',
+                  month: 'long',
+                  day: 'numeric',
+                })}
+                accessibilityState={{ selected: isSelected }}
+                onPress={() => onDateChange(value)}
+                style={[
+                  styles.calendarDay,
+                  {
+                    backgroundColor: isSelected ? palette.strong : palette.surface,
+                    borderColor: isSelected ? palette.strong : palette.border,
+                  },
+                ]}
+              >
+                <Text
+                  style={[
+                    styles.calendarDayLabel,
+                    { color: isSelected ? palette.strongText : palette.secondary },
+                  ]}
+                >
+                  {day.toLocaleDateString(undefined, { weekday: 'short' })}
+                </Text>
+                <Text
+                  style={[
+                    styles.calendarDayNumber,
+                    { color: isSelected ? palette.strongText : palette.text },
+                  ]}
+                >
+                  {day.getDate()}
+                </Text>
+              </Pressable>
+            );
+          })}
+        </View>
+
+        <View style={styles.agendaHeading}>
+          <Text style={[styles.sectionTitle, { color: palette.text }]}>
+            {selectedDate === today ? 'Today’s agenda' : dateLabel(selectedDate, today)}
+          </Text>
+          <Text style={[styles.sectionCount, { color: palette.muted }]}>
+            {`${datedTasks.length + events.length}`.padStart(2, '0')}
+          </Text>
+        </View>
+
+        {!datedTasks.length && !events.length ? (
+          <View style={[styles.agendaEmpty, { borderColor: palette.border }]}>
+            <Text style={[styles.emptyTitle, { color: palette.text }]}>
+              Nothing planned
+            </Text>
+            <Text style={[styles.emptyBody, { color: palette.secondary }]}>
+              Tasks with this due date will appear here, including completed occurrences.
+            </Text>
+          </View>
+        ) : (
+          <>
+            {events.map(event => {
+              const completedTime = new Date(event.completedAt).toLocaleTimeString(
+                undefined,
+                { hour: 'numeric', minute: '2-digit' },
+              );
+              return (
+                <View
+                  key={event.id}
+                  style={[styles.agendaEvent, { borderBottomColor: palette.border }]}
+                >
+                  <View
+                    style={[
+                      styles.agendaCheck,
+                      { borderColor: palette.strong, backgroundColor: palette.strong },
+                    ]}
+                  >
+                    <Text style={[styles.checkmark, { color: palette.strongText }]}>
+                      ✓
+                    </Text>
+                  </View>
+                  <View style={styles.taskContent}>
+                    <Text
+                      style={[
+                        styles.taskTitle,
+                        {
+                          color: palette.completed,
+                          textDecorationLine: 'line-through',
+                        },
+                      ]}
+                    >
+                      {event.title}
+                    </Text>
+                    <Text style={[styles.taskMetaText, { color: palette.secondary }]}>
+                      Completed · {completedTime}
+                    </Text>
+                  </View>
+                </View>
+              );
+            })}
+            {datedTasks.map(task => (
+              <TaskRow
+                key={task.id}
+                task={task}
+                palette={palette}
+                onToggle={() => onToggle(task.id)}
+                onEdit={() => onEdit(task)}
+                onDelete={() => onDelete(task)}
+              />
+            ))}
+          </>
+        )}
+      </ScrollView>
+    </>
+  );
+}
+
+function StatisticsScreen({
+  statistics,
+  hasHistory,
+  palette,
+}: {
+  statistics: ProductivityStatistics;
+  hasHistory: boolean;
+  palette: Palette;
+}) {
+  return (
+    <>
+      <View style={[styles.topBar, { borderBottomColor: palette.border }]}>
+        <Text style={[styles.wordmark, { color: palette.text }]}>{APP_NAME}</Text>
+        <Text style={[styles.topBarLabel, { color: palette.secondary }]}>REFLECT</Text>
+      </View>
+      <ScrollView
+        contentContainerStyle={styles.statisticsContent}
+        showsVerticalScrollIndicator={false}
+      >
+        <Text style={[styles.dateText, { color: palette.secondary }]}>
+          YOUR PROGRESS
+        </Text>
+        <Text style={[styles.pageTitle, { color: palette.text }]}>Statistics</Text>
+        <Text style={[styles.pageSubtitle, { color: palette.secondary }]}>
+          A small, honest look at the work you have finished.
+        </Text>
+
+        {!hasHistory && (
+          <View style={[styles.statisticsEmpty, { borderColor: palette.border }]}>
+            <Text style={[styles.emptyTitle, { color: palette.text }]}>
+              Your history starts with a completion
+            </Text>
+            <Text style={[styles.emptyBody, { color: palette.secondary }]}>
+              Still does not estimate completions made before this history was introduced.
+            </Text>
+          </View>
+        )}
+
+        <View style={styles.statisticsGrid}>
+          <StatisticCard label="TODAY" value={statistics.completedToday} palette={palette} />
+          <StatisticCard
+            label="LAST 7 DAYS"
+            value={statistics.completedLastSevenDays}
+            palette={palette}
+          />
+          <StatisticCard label="TOTAL COMPLETED" value={statistics.totalCompleted} palette={palette} />
+          <StatisticCard
+            label="CURRENT STREAK"
+            value={statistics.currentStreak === null ? '—' : `${statistics.currentStreak}d`}
+            palette={palette}
+          />
+        </View>
+
+        <View
+          style={[
+            styles.rateCard,
+            { backgroundColor: palette.surface, borderColor: palette.border },
+          ]}
+        >
+          <Text style={[styles.progressLabel, { color: palette.secondary }]}>
+            COMPLETION RATE
+          </Text>
+          <Text style={[styles.rateValue, { color: palette.text }]}>
+            {statistics.completionRate === null
+              ? '—'
+              : `${Math.round(statistics.completionRate * 100)}%`}
+          </Text>
+          <Text style={[styles.settingDescription, { color: palette.secondary }]}>
+            Recorded completed occurrences ÷ completed occurrences plus currently due or
+            overdue incomplete tasks. Undated tasks are not in this calculation.
+          </Text>
+          <Text style={[styles.statisticsFootnote, { color: palette.muted }]}>
+            A streak day has at least one recorded completion. Today or yesterday may be
+            the latest active day; earlier completions are not inferred.
+          </Text>
+        </View>
+      </ScrollView>
+    </>
+  );
+}
+
+function StatisticCard({
+  label,
+  value,
+  palette,
+}: {
+  label: string;
+  value: number | string;
+  palette: Palette;
+}) {
+  return (
+    <View
+      style={[
+        styles.statisticCard,
+        { backgroundColor: palette.surface, borderColor: palette.border },
+      ]}
+    >
+      <Text style={[styles.statisticLabel, { color: palette.secondary }]}>{label}</Text>
+      <Text style={[styles.statisticValue, { color: palette.text }]}>{value}</Text>
+    </View>
+  );
+}
+
 function TabButton({
   label,
   mark,
@@ -1014,11 +1726,15 @@ function SettingsScreen({
   themePreference,
   onThemeChange,
   onReplayOnboarding,
+  onExportBackup,
+  onRestoreBackup,
 }: {
   palette: Palette;
   themePreference: ThemePreference;
   onThemeChange: (value: ThemePreference) => void;
   onReplayOnboarding: () => void;
+  onExportBackup: () => void;
+  onRestoreBackup: () => void;
 }) {
   return (
     <ScrollView
@@ -1073,6 +1789,42 @@ function SettingsScreen({
       </View>
 
       <Text style={[styles.settingsSectionLabel, { color: palette.secondary }]}>
+        YOUR DATA
+      </Text>
+      <View style={styles.backupActions}>
+        <Pressable
+          accessibilityRole="button"
+          onPress={onExportBackup}
+          style={[styles.settingsAction, { borderColor: palette.border }]}
+        >
+          <View>
+            <Text style={[styles.settingTitle, { color: palette.text }]}>
+              Export backup
+            </Text>
+            <Text style={[styles.settingDescription, { color: palette.secondary }]}>
+              Prepare a versioned JSON file to save or share locally.
+            </Text>
+          </View>
+          <Text style={[styles.actionArrow, { color: palette.secondary }]}>↓</Text>
+        </Pressable>
+        <Pressable
+          accessibilityRole="button"
+          onPress={onRestoreBackup}
+          style={[styles.settingsAction, { borderColor: palette.border }]}
+        >
+          <View>
+            <Text style={[styles.settingTitle, { color: palette.text }]}>
+              Restore backup
+            </Text>
+            <Text style={[styles.settingDescription, { color: palette.secondary }]}>
+              Select a Still JSON backup to merge or replace.
+            </Text>
+          </View>
+          <Text style={[styles.actionArrow, { color: palette.secondary }]}>↑</Text>
+        </Pressable>
+      </View>
+
+      <Text style={[styles.settingsSectionLabel, { color: palette.secondary }]}>
         ABOUT
       </Text>
       <View style={[styles.settingsGroup, { borderColor: palette.border }]}>
@@ -1119,12 +1871,14 @@ function TaskEditor({
   selectedDate,
   customDate,
   priority,
+  recurrence,
   palette,
   onChangeTitle,
   onChangeDescription,
   onSelectDate,
   onChangeCustomDate,
   onSelectPriority,
+  onSelectRecurrence,
   onSave,
   onClose,
 }: {
@@ -1135,12 +1889,14 @@ function TaskEditor({
   selectedDate: string | null;
   customDate: string;
   priority: Priority;
+  recurrence: RecurrenceRule | null;
   palette: Palette;
   onChangeTitle: (value: string) => void;
   onChangeDescription: (value: string) => void;
   onSelectDate: (value: string | null) => void;
   onChangeCustomDate: (value: string) => void;
   onSelectPriority: (value: Priority) => void;
+  onSelectRecurrence: (value: RecurrenceRule | null) => void;
   onSave: () => void;
   onClose: () => void;
 }) {
@@ -1269,6 +2025,76 @@ function TaskEditor({
               ))}
             </View>
 
+            <Text style={[styles.fieldLabel, { color: palette.secondary }]}>
+              REPEAT
+            </Text>
+            <View style={styles.choiceRow}>
+              <FilterChip
+                label="Never"
+                selected={!recurrence}
+                palette={palette}
+                onPress={() => onSelectRecurrence(null)}
+              />
+              <FilterChip
+                label="Daily"
+                selected={recurrence?.type === 'daily'}
+                palette={palette}
+                onPress={() => onSelectRecurrence({ type: 'daily' })}
+              />
+              <FilterChip
+                label="Weekly"
+                selected={recurrence?.type === 'weekly'}
+                palette={palette}
+                onPress={() => onSelectRecurrence({ type: 'weekly' })}
+              />
+              <FilterChip
+                label="Custom days"
+                selected={recurrence?.type === 'weekdays'}
+                palette={palette}
+                onPress={() => {
+                  if (recurrence?.type === 'weekdays') return;
+                  const anchor =
+                    (customDate.trim() && parseDate(customDate.trim())
+                      ? customDate.trim()
+                      : selectedDate) ?? today;
+                  const defaultDay = parseDate(anchor)?.getDay() ?? new Date().getDay();
+                  onSelectRecurrence({
+                    type: 'weekdays',
+                    days: [defaultDay as Weekday],
+                  });
+                }}
+              />
+            </View>
+            {recurrence?.type === 'weekdays' && (
+              <View style={[styles.choiceRow, styles.weekdayOptions]}>
+                {weekdayLabels.map((label, day) => {
+                  const selected = recurrence.days.includes(day as Weekday);
+                  return (
+                    <FilterChip
+                      key={label}
+                      label={label}
+                      selected={selected}
+                      palette={palette}
+                      onPress={() => {
+                        if (selected && recurrence.days.length === 1) return;
+                        const days = selected
+                          ? recurrence.days.filter(item => item !== day)
+                          : [...recurrence.days, day as Weekday];
+                        onSelectRecurrence({
+                          type: 'weekdays',
+                          days: weekdayOrder.filter(day => days.includes(day)),
+                        });
+                      }}
+                    />
+                  );
+                })}
+              </View>
+            )}
+            <Text style={[styles.recurrenceHint, { color: palette.muted }]}>
+              Missed dates are skipped. Completing an overdue repeat schedules the next date
+              after today.
+            </Text>
+
             <View style={styles.modalActions}>
               <Pressable
                 accessibilityRole="button"
@@ -1396,6 +2222,8 @@ const styles = {
   },
   topBarLabel: { fontSize: 9, letterSpacing: 1.7, fontWeight: '600' },
   scrollContent: { paddingHorizontal: 23, paddingTop: 28, paddingBottom: 35 },
+  calendarContent: { paddingHorizontal: 23, paddingTop: 28, paddingBottom: 35 },
+  statisticsContent: { paddingHorizontal: 23, paddingTop: 28, paddingBottom: 35 },
   dateText: { fontSize: 9, letterSpacing: 1.7, fontWeight: '600' },
   pageTitle: { fontSize: 37, lineHeight: 43, letterSpacing: -1.7, fontWeight: '600', marginTop: 9 },
   pageSubtitle: { fontSize: 14, marginTop: 6, marginBottom: 21, lineHeight: 20 },
@@ -1405,6 +2233,13 @@ const styles = {
   progressValue: { fontSize: 12, fontWeight: '600' },
   progressTrack: { height: 4, borderRadius: 2, overflow: 'hidden' },
   progressFill: { height: 4, borderRadius: 2 },
+  widgetPreview: { borderWidth: 1, borderRadius: 10, padding: 13, marginBottom: 12 },
+  widgetPreviewTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 5 },
+  widgetPreviewEyebrow: { fontSize: 8, letterSpacing: 1.2, fontWeight: '600' },
+  widgetPreviewTitle: { fontSize: 13, fontWeight: '600', marginTop: 4 },
+  widgetPreviewCount: { fontSize: 22, fontWeight: '600' },
+  widgetPreviewTask: { fontSize: 11, lineHeight: 19 },
+  widgetPreviewNote: { fontSize: 9, marginTop: 5 },
   addButton: {
     height: 50,
     borderWidth: 1,
@@ -1502,6 +2337,28 @@ const styles = {
   tabButton: { flex: 1, height: '100%', justifyContent: 'center', alignItems: 'center', gap: 3 },
   tabMark: { fontSize: 17, lineHeight: 19, fontWeight: '500' },
   tabLabel: { fontSize: 10, fontWeight: '500' },
+  calendarControls: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 4, marginBottom: 13 },
+  calendarArrow: { width: 34, height: 34, borderWidth: 1, borderRadius: 8, alignItems: 'center', justifyContent: 'center' },
+  calendarArrowText: { fontSize: 23, lineHeight: 27 },
+  calendarMonth: { flex: 1, fontSize: 13, fontWeight: '600', textAlign: 'center' },
+  todayButton: { minHeight: 34, borderWidth: 1, borderRadius: 8, paddingHorizontal: 10, alignItems: 'center', justifyContent: 'center' },
+  todayButtonText: { fontSize: 11, fontWeight: '500' },
+  calendarWeek: { flexDirection: 'row', gap: 5, marginBottom: 23 },
+  calendarDay: { flex: 1, minHeight: 61, borderWidth: 1, borderRadius: 8, alignItems: 'center', justifyContent: 'center', gap: 5 },
+  calendarDayLabel: { fontSize: 9 },
+  calendarDayNumber: { fontSize: 13, fontWeight: '600' },
+  agendaHeading: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingBottom: 8 },
+  agendaEmpty: { borderWidth: 1, borderRadius: 10, padding: 18, alignItems: 'center' },
+  agendaEvent: { minHeight: 60, flexDirection: 'row', alignItems: 'center', borderBottomWidth: StyleSheet.hairlineWidth, paddingVertical: 10 },
+  agendaCheck: { width: 20, height: 20, borderRadius: 6, borderWidth: 1.4, alignItems: 'center', justifyContent: 'center', marginRight: 12 },
+  statisticsEmpty: { borderWidth: 1, borderRadius: 10, padding: 16, marginBottom: 13 },
+  statisticsGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 9 },
+  statisticCard: { width: '48%', minHeight: 94, borderWidth: 1, borderRadius: 10, padding: 13, justifyContent: 'space-between', flexGrow: 1 },
+  statisticLabel: { fontSize: 8, letterSpacing: 1, fontWeight: '600' },
+  statisticValue: { fontSize: 25, fontWeight: '600', letterSpacing: -0.6 },
+  rateCard: { borderWidth: 1, borderRadius: 10, padding: 15, marginTop: 11 },
+  rateValue: { fontSize: 29, fontWeight: '600', marginTop: 6, marginBottom: 2 },
+  statisticsFootnote: { fontSize: 10, lineHeight: 15, marginTop: 13 },
   settingsContent: { paddingHorizontal: 23, paddingTop: 34, paddingBottom: 35 },
   settingsSectionLabel: { fontSize: 9, fontWeight: '600', letterSpacing: 1.6, marginTop: 27, marginBottom: 10 },
   settingsGroup: { borderWidth: 1, borderRadius: 10, padding: 15 },
@@ -1523,6 +2380,7 @@ const styles = {
     alignItems: 'center',
     justifyContent: 'space-between',
   },
+  backupActions: { gap: 8 },
   actionArrow: { fontSize: 19, marginLeft: 10 },
   modalBackdrop: { flex: 1, justifyContent: 'center', padding: 18 },
   modalCard: { width: '100%', maxWidth: 480, maxHeight: '90%', alignSelf: 'center', borderRadius: 16, overflow: 'hidden' },
@@ -1535,6 +2393,8 @@ const styles = {
   titleInput: { minHeight: 47, borderWidth: 1, borderRadius: 8, paddingHorizontal: 12, fontSize: 14 },
   descriptionInput: { minHeight: 67, borderWidth: 1, borderRadius: 8, paddingHorizontal: 12, paddingTop: 11, fontSize: 13 },
   choiceRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 7 },
+  weekdayOptions: { marginTop: 8 },
+  recurrenceHint: { fontSize: 10, lineHeight: 15, marginTop: 8 },
   dateInput: { minHeight: 43, borderWidth: 1, borderRadius: 8, paddingHorizontal: 11, fontSize: 12, marginTop: 9 },
   modalActions: { flexDirection: 'row', gap: 9, marginTop: 23 },
   cancelButton: { flex: 1, minHeight: 47, borderWidth: 1, borderRadius: 8, alignItems: 'center', justifyContent: 'center' },
