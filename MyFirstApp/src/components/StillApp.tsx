@@ -2,9 +2,11 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as DocumentPicker from 'expo-document-picker';
 import { File, Paths } from 'expo-file-system';
 import * as Sharing from 'expo-sharing';
+import * as Linking from 'expo-linking';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
+  Image,
   KeyboardAvoidingView,
   Modal,
   Platform,
@@ -55,8 +57,9 @@ import {
 const pages = [
   {
     label: 'WELCOME TO STILL',
-    title: 'A little more\nroom to think.',
-    body: "Hi, I'm Erhan. Still is my first mobile app. I wanted to make everyday task management feel simple.",
+    title: 'Meet Still.',
+    subtitle: 'A calmer way to organize your day.',
+    body: 'Plan your tasks, build routines, and keep track of your progress — one step at a time.',
     art: 'welcome',
   },
   {
@@ -109,6 +112,24 @@ type Palette = (typeof palettes)[keyof typeof palettes];
 const weekdayLabels = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'] as const;
 const weekdayOrder: Weekday[] = [0, 1, 2, 3, 4, 5, 6];
 
+function Mascot({
+  size,
+  label = 'Still mascot',
+}: {
+  size: number;
+  label?: string;
+}) {
+  return (
+    <Image
+      source={require('../../assets/images/still-mascot.png')}
+      resizeMode="contain"
+      accessibilityLabel={label}
+      accessible
+      style={{ width: size, height: size }}
+    />
+  );
+}
+
 function recurrenceLabel(rule: RecurrenceRule | null | undefined): string | null {
   if (!rule) return null;
   if (rule.type === 'daily') return 'Daily';
@@ -150,6 +171,19 @@ function OnboardingIllustration({
   page: (typeof pages)[number];
   palette: Palette;
 }) {
+  if (page.art === 'welcome') {
+    return (
+      <View
+        style={[
+          styles.welcomeMascotFrame,
+          { backgroundColor: palette.surface, borderColor: palette.border },
+        ]}
+      >
+        <Mascot size={220} label="Still mascot welcoming you to Still" />
+      </View>
+    );
+  }
+
   const card = [styles.illustrationCard, { backgroundColor: palette.surface, borderColor: palette.border }];
   const line = [styles.illustrationLine, { backgroundColor: palette.border }];
   return (
@@ -157,54 +191,50 @@ function OnboardingIllustration({
       <View style={[styles.illustrationOrbit, { borderColor: palette.border }]}>
         <View style={[styles.illustrationCore, { backgroundColor: palette.strong }]}>
           <Text style={[styles.illustrationMark, { color: palette.strongText }]}>
-            {page.art === 'welcome' ? 's.' : page.art === 'plan' ? '+' : '✓'}
+            {page.art === 'plan' ? '+' : '✓'}
           </Text>
         </View>
-        {page.art !== 'welcome' && (
-          <View style={[styles.illustrationDot, { backgroundColor: palette.secondary }]} />
-        )}
+        <View style={[styles.illustrationDot, { backgroundColor: palette.secondary }]} />
       </View>
-      {page.art !== 'welcome' && (
-        <View style={card}>
-          {[0, 1, 2].map(index => (
-            <View key={index} style={styles.illustrationRow}>
-              <View
-                style={[
-                  styles.illustrationCheck,
-                  {
-                    borderColor:
-                      page.art === 'progress' && index === 0
-                        ? palette.strong
-                        : palette.muted,
-                    backgroundColor:
-                      page.art === 'progress' && index === 0
-                        ? palette.strong
-                        : 'transparent',
-                  },
-                ]}
-              >
-                {page.art === 'progress' && index === 0 && (
-                  <Text style={[styles.illustrationTick, { color: palette.strongText }]}>
-                    ✓
-                  </Text>
-                )}
-              </View>
-              <View
-                style={[
-                  line,
-                  {
-                    width: index === 1 ? '44%' : '62%',
-                    opacity: page.art === 'progress' && index === 0 ? 0.45 : 1,
-                  },
-                ]}
-              />
-              {page.art === 'plan' && index === 1 && (
-                <View style={[styles.illustrationPriority, { backgroundColor: palette.border }]} />
+      <View style={card}>
+        {[0, 1, 2].map(index => (
+          <View key={index} style={styles.illustrationRow}>
+            <View
+              style={[
+                styles.illustrationCheck,
+                {
+                  borderColor:
+                    page.art === 'progress' && index === 0
+                      ? palette.strong
+                      : palette.muted,
+                  backgroundColor:
+                    page.art === 'progress' && index === 0
+                      ? palette.strong
+                      : 'transparent',
+                },
+              ]}
+            >
+              {page.art === 'progress' && index === 0 && (
+                <Text style={[styles.illustrationTick, { color: palette.strongText }]}>
+                  ✓
+                </Text>
               )}
             </View>
-          ))}
-        </View>
-      )}
+            <View
+              style={[
+                line,
+                {
+                  width: index === 1 ? '44%' : '62%',
+                  opacity: page.art === 'progress' && index === 0 ? 0.45 : 1,
+                },
+              ]}
+            />
+            {page.art === 'plan' && index === 1 && (
+              <View style={[styles.illustrationPriority, { backgroundColor: palette.border }]} />
+            )}
+          </View>
+        ))}
+      </View>
     </View>
   );
 }
@@ -864,11 +894,15 @@ export default function StillApp() {
     return (
       <SafeAreaView style={[styles.safeArea, { backgroundColor: palette.background }]}>
         <StatusBar barStyle={effectiveTheme === 'dark' ? 'light-content' : 'dark-content'} />
-        <View style={styles.onboardingScreen}>
+        <ScrollView
+          contentContainerStyle={styles.onboardingScreen}
+          showsVerticalScrollIndicator={false}
+        >
           <View style={styles.onboardingTop}>
             <Text style={[styles.wordmark, { color: palette.text }]}>{APP_NAME}</Text>
             <Pressable
               accessibilityRole="button"
+              accessibilityLabel="Skip onboarding"
               onPress={() => void finishOnboarding()}
               hitSlop={10}
             >
@@ -885,6 +919,11 @@ export default function StillApp() {
             <Text style={[styles.onboardingTitle, { color: palette.text }]}>
               {currentPage.title}
             </Text>
+            {'subtitle' in currentPage && (
+              <Text style={[styles.onboardingSubtitle, { color: palette.text }]}>
+                {currentPage.subtitle}
+              </Text>
+            )}
             <Text style={[styles.onboardingBody, { color: palette.secondary }]}>
               {currentPage.body}
             </Text>
@@ -907,13 +946,24 @@ export default function StillApp() {
             </View>
             <Pressable
               accessibilityRole="button"
+              accessibilityLabel={
+                page === 0
+                  ? 'Get started with Still'
+                  : page < pages.length - 1
+                    ? 'Continue onboarding'
+                    : 'Start planning with Still'
+              }
               style={[styles.primaryButton, { backgroundColor: palette.strong }]}
               onPress={() =>
                 page < pages.length - 1 ? setPage(page + 1) : void finishOnboarding()
               }
             >
               <Text style={[styles.primaryButtonText, { color: palette.strongText }]}>
-                {page < pages.length - 1 ? 'Continue' : 'Get started'}
+                {page === 0
+                  ? 'Get started'
+                  : page < pages.length - 1
+                    ? 'Continue'
+                    : 'Start planning'}
               </Text>
               <Text style={[styles.buttonArrow, { color: palette.strongText }]}>→</Text>
             </Pressable>
@@ -921,7 +971,7 @@ export default function StillApp() {
               MADE BY ERHAN, FOR EVERYDAY
             </Text>
           </View>
-        </View>
+        </ScrollView>
       </SafeAreaView>
     );
   }
@@ -1113,11 +1163,23 @@ export default function StillApp() {
 
               {!matchingTasks.length ? (
                 <View style={styles.emptyState}>
-                  <View style={[styles.emptyMark, { borderColor: palette.border }]}>
-                    <Text style={[styles.emptyMarkText, { color: palette.secondary }]}>
-                      {search || statusFilter !== 'all' || priorityFilter !== 'all' ? '⌕' : '+'}
-                    </Text>
-                  </View>
+                  {!hasSearchOrPriorityFilter &&
+                  (statusFilter === 'all' || statusFilter === 'completed') ? (
+                    <Mascot
+                      size={112}
+                      label={
+                        statusFilter === 'completed'
+                          ? 'Still mascot beside your completed tasks'
+                          : 'Still mascot beside your empty task list'
+                      }
+                    />
+                  ) : (
+                    <View style={[styles.emptyMark, { borderColor: palette.border }]}>
+                      <Text style={[styles.emptyMarkText, { color: palette.secondary }]}>
+                        {search || statusFilter !== 'all' || priorityFilter !== 'all' ? '⌕' : '+'}
+                      </Text>
+                    </View>
+                  )}
                   <Text style={[styles.emptyTitle, { color: palette.text }]}>
                     {hasSearchOrPriorityFilter
                       ? 'No matching tasks'
@@ -1137,7 +1199,12 @@ export default function StillApp() {
                           : 'Add one small thing to begin.'}
                   </Text>
                   {!search && statusFilter === 'all' && priorityFilter === 'all' && (
-                    <Pressable onPress={openNewTask} style={styles.emptyAction}>
+                    <Pressable
+                      accessibilityRole="button"
+                      accessibilityLabel="Create your first task"
+                      onPress={openNewTask}
+                      style={styles.emptyAction}
+                    >
                       <Text style={[styles.emptyActionText, { color: palette.text }]}>
                         Create your first task →
                       </Text>
@@ -1167,8 +1234,17 @@ export default function StillApp() {
                       onDelete={confirmDelete}
                       emptyText={
                         statusFilter === 'all' && !search && priorityFilter === 'all'
-                          ? 'Nothing planned for today.'
+                          ? activeCount === 0 && tasks.length > 0
+                            ? 'A day well done.'
+                            : 'Nothing planned for today.'
                           : 'No tasks match here.'
+                      }
+                      showCompletionMascot={
+                        statusFilter === 'all' &&
+                        !search &&
+                        priorityFilter === 'all' &&
+                        activeCount === 0 &&
+                        tasks.length > 0
                       }
                     />
                   )}
@@ -1339,6 +1415,7 @@ function TaskSection({
   onEdit,
   onDelete,
   emptyText,
+  showCompletionMascot = false,
 }: {
   title: string;
   tasks: Task[];
@@ -1347,6 +1424,7 @@ function TaskSection({
   onEdit: (task: Task) => void;
   onDelete: (task: Task) => void;
   emptyText: string;
+  showCompletionMascot?: boolean;
 }) {
   return (
     <View style={styles.taskSection}>
@@ -1363,7 +1441,12 @@ function TaskSection({
           />
         ))
       ) : (
-        <Text style={[styles.sectionEmpty, { color: palette.muted }]}>{emptyText}</Text>
+        <>
+          {showCompletionMascot && (
+            <Mascot size={76} label="Still mascot celebrating your completed daily tasks" />
+          )}
+          <Text style={[styles.sectionEmpty, { color: palette.muted }]}>{emptyText}</Text>
+        </>
       )}
     </View>
   );
@@ -1513,11 +1596,12 @@ function CalendarScreen({
 
         {!datedTasks.length && !events.length ? (
           <View style={[styles.agendaEmpty, { borderColor: palette.border }]}>
+            <Mascot size={90} label="Still mascot beside your empty calendar" />
             <Text style={[styles.emptyTitle, { color: palette.text }]}>
               Nothing planned
             </Text>
             <Text style={[styles.emptyBody, { color: palette.secondary }]}>
-              Tasks with this due date will appear here, including completed occurrences.
+              A little breathing room. Tasks for this date will appear here.
             </Text>
           </View>
         ) : (
@@ -1825,16 +1909,23 @@ function SettingsScreen({
       </View>
 
       <Text style={[styles.settingsSectionLabel, { color: palette.secondary }]}>
-        ABOUT
+        ABOUT & SOCIALS
       </Text>
       <View style={[styles.settingsGroup, { borderColor: palette.border }]}>
         <Text style={[styles.settingTitle, { color: palette.text }]}>
-          A note from Erhan
+          {APP_NAME}
         </Text>
         <Text style={[styles.aboutText, { color: palette.secondary }]}>
-          I made Still as my first mobile app. The goal is simple: make everyday
-          task management feel a little easier.
+          Made by Erhan. A calmer way to organize your day.
         </Text>
+        <View style={[styles.settingsDivider, { backgroundColor: palette.border }]} />
+        <SocialLinkRow label="X" url="https://x.com/oherhor?s=11" palette={palette} />
+        <View style={[styles.settingsDivider, { backgroundColor: palette.border }]} />
+        <SocialLinkRow
+          label="Instagram"
+          url="https://www.instagram.com/erhanoruj?mdxt=MXdmY2xsd3o3b3BnMw%3D%3D&utm_source=qr"
+          palette={palette}
+        />
         <View style={[styles.settingsDivider, { backgroundColor: palette.border }]} />
         <Text style={[styles.appVersion, { color: palette.muted }]}>
           {APP_NAME.toUpperCase()} · MADE FOR EVERYDAY
@@ -1860,6 +1951,37 @@ function SettingsScreen({
         <Text style={[styles.actionArrow, { color: palette.secondary }]}>→</Text>
       </Pressable>
     </ScrollView>
+  );
+}
+
+function SocialLinkRow({
+  label,
+  url,
+  palette,
+}: {
+  label: 'X' | 'Instagram';
+  url: string;
+  palette: Palette;
+}) {
+  async function openProfile() {
+    try {
+      await Linking.openURL(url);
+    } catch (error) {
+      console.error(`Still could not open the ${label} profile.`, error);
+      Alert.alert('Could not open link', 'Please try again in a moment.');
+    }
+  }
+
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={`Open Still's ${label} profile`}
+      onPress={() => void openProfile()}
+      style={styles.socialLink}
+    >
+      <Text style={[styles.settingTitle, { color: palette.text }]}>{label}</Text>
+      <Text style={[styles.actionArrow, { color: palette.secondary }]}>↗</Text>
+    </Pressable>
   );
 }
 
@@ -2128,7 +2250,7 @@ const styles = {
   loading: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   wordmark: { fontSize: 25, fontWeight: '700', letterSpacing: -1.3 },
   loadingCaption: { marginTop: 8, fontSize: 13 },
-  onboardingScreen: { flex: 1, paddingHorizontal: 26 },
+  onboardingScreen: { flexGrow: 1, paddingHorizontal: 26 },
   onboardingTop: {
     minHeight: 58,
     flexDirection: 'row',
@@ -2136,6 +2258,17 @@ const styles = {
     justifyContent: 'space-between',
   },
   skipText: { fontSize: 14, paddingVertical: 10, paddingLeft: 10 },
+  welcomeMascotFrame: {
+    flex: 1,
+    minHeight: 180,
+    maxHeight: 220,
+    borderWidth: 1,
+    borderRadius: 120,
+    justifyContent: 'center',
+    alignItems: 'center',
+    alignSelf: 'center',
+    aspectRatio: 1,
+  },
   illustration: {
     flex: 1,
     minHeight: 200,
@@ -2192,6 +2325,7 @@ const styles = {
   onboardingCopy: { paddingTop: 16, paddingBottom: 20 },
   eyebrow: { fontSize: 10, letterSpacing: 1.8, fontWeight: '600', marginBottom: 15 },
   onboardingTitle: { fontSize: 43, lineHeight: 48, letterSpacing: -2, fontWeight: '600' },
+  onboardingSubtitle: { fontSize: 17, lineHeight: 23, marginTop: 9, fontWeight: '500' },
   onboardingBody: { fontSize: 15, lineHeight: 23, marginTop: 15, maxWidth: 330 },
   onboardingFooter: { paddingTop: 10, paddingBottom: 16 },
   progressDots: { flexDirection: 'row', gap: 7, marginBottom: 20 },
@@ -2368,6 +2502,12 @@ const styles = {
   themeOption: { flex: 1, minHeight: 35, borderRadius: 7, borderWidth: 1, alignItems: 'center', justifyContent: 'center' },
   themeOptionText: { fontSize: 11, fontWeight: '500' },
   aboutText: { fontSize: 13, lineHeight: 21, marginTop: 10 },
+  socialLink: {
+    minHeight: 50,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
   settingsDivider: { height: StyleSheet.hairlineWidth, marginVertical: 14 },
   appVersion: { fontSize: 9, letterSpacing: 1.2 },
   settingsAction: {
