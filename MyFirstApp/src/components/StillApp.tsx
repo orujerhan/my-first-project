@@ -53,6 +53,17 @@ import {
   serializeTaskStore,
   validateBackup,
 } from '@/lib/taskData';
+import {
+  defaultMotivationState,
+  getLevelProgress,
+  MOTIVATION_STORAGE_KEY,
+  MOTIVATION_TRANSACTION_STORAGE_KEY,
+  readMotivationTransaction,
+  readMotivationState,
+  rewardTaskCompletion,
+  type AppearanceTheme,
+  type MotivationState,
+} from '@/lib/motivation';
 
 const pages = [
   {
@@ -76,7 +87,22 @@ const pages = [
   },
 ] as const;
 
-const palettes = {
+type Palette = {
+  background: string;
+  surface: string;
+  raised: string;
+  text: string;
+  secondary: string;
+  muted: string;
+  border: string;
+  strong: string;
+  strongText: string;
+  track: string;
+  completed: string;
+  scrim: string;
+};
+
+const palettes: Record<'light' | 'dark' | 'calm-light' | 'midnight' | 'blue-hour', Palette> = {
   light: {
     background: '#FFFFFF',
     surface: '#F7F7F6',
@@ -105,9 +131,81 @@ const palettes = {
     completed: '#777777',
     scrim: 'rgba(0,0,0,0.66)',
   },
+  'calm-light': {
+    background: '#FAFAF8',
+    surface: '#F1F1EE',
+    raised: '#FFFFFF',
+    text: '#20201E',
+    secondary: '#6F6F6B',
+    muted: '#969691',
+    border: '#E2E2DE',
+    strong: '#252523',
+    strongText: '#FFFFFF',
+    track: '#E2E2DE',
+    completed: '#A5A59F',
+    scrim: 'rgba(0,0,0,0.34)',
+  },
+  midnight: {
+    background: '#101116',
+    surface: '#191B22',
+    raised: '#20222A',
+    text: '#F1F2F4',
+    secondary: '#A6A9B2',
+    muted: '#777B86',
+    border: '#30333D',
+    strong: '#E9EBF0',
+    strongText: '#111217',
+    track: '#343742',
+    completed: '#777B86',
+    scrim: 'rgba(0,0,0,0.70)',
+  },
+  'blue-hour': {
+    background: '#F4F7FA',
+    surface: '#E8EEF4',
+    raised: '#FFFFFF',
+    text: '#17232F',
+    secondary: '#536778',
+    muted: '#8193A1',
+    border: '#D5E0E8',
+    strong: '#314F68',
+    strongText: '#FFFFFF',
+    track: '#D8E3EB',
+    completed: '#8A9CA9',
+    scrim: 'rgba(15,30,44,0.40)',
+  },
 } as const;
 
-type Palette = (typeof palettes)[keyof typeof palettes];
+const rewardShopThemes: {
+  id: AppearanceTheme;
+  name: string;
+  description: string;
+  cost: number;
+}[] = [
+  {
+    id: 'default',
+    name: 'Default',
+    description: 'Your current light, dark, or system setting.',
+    cost: 0,
+  },
+  {
+    id: 'calm-light',
+    name: 'Calm Light',
+    description: 'A soft, warm neutral palette.',
+    cost: 150,
+  },
+  {
+    id: 'midnight',
+    name: 'Midnight',
+    description: 'A quiet, deep-toned dark palette.',
+    cost: 250,
+  },
+  {
+    id: 'blue-hour',
+    name: 'Blue Hour',
+    description: 'Cool blue-gray tones for a softer contrast.',
+    cost: 350,
+  },
+];
 
 const weekdayLabels = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'] as const;
 const weekdayOrder: Weekday[] = [0, 1, 2, 3, 4, 5, 6];
@@ -143,6 +241,42 @@ function showStorageError(action: string, error: unknown) {
     'Could not save changes',
     'Your changes are on screen, but could not be saved on this device. Please try again.',
   );
+}
+
+async function recoverProgressTransaction() {
+  const pendingValue = await AsyncStorage.getItem(
+    MOTIVATION_TRANSACTION_STORAGE_KEY,
+  );
+  const pendingWrites = readMotivationTransaction(pendingValue);
+  if (!pendingWrites) return;
+  await AsyncStorage.multiSet(pendingWrites);
+  try {
+    await AsyncStorage.removeItem(MOTIVATION_TRANSACTION_STORAGE_KEY);
+  } catch (error) {
+    console.error('Still could not clear a recovered progress transaction.', error);
+    Alert.alert(
+      'Progress recovered',
+      'Your saved tasks and rewards were recovered. Still will retry clearing its recovery record later.',
+    );
+  }
+}
+
+async function persistProgressTransaction(values: [string, string][]) {
+  await recoverProgressTransaction();
+  await AsyncStorage.setItem(
+    MOTIVATION_TRANSACTION_STORAGE_KEY,
+    JSON.stringify({ version: 1, values }),
+  );
+  await AsyncStorage.multiSet(values);
+  try {
+    await AsyncStorage.removeItem(MOTIVATION_TRANSACTION_STORAGE_KEY);
+  } catch (error) {
+    console.error('Still could not clear its progress recovery record.', error);
+    Alert.alert(
+      'Progress saved',
+      'Your changes were saved. Still will clear its recovery record the next time it opens.',
+    );
+  }
 }
 
 function SectionTitle({
@@ -349,6 +483,7 @@ export default function StillApp() {
   const [today, setToday] = useState(() => formatDate(new Date()));
   const [tasks, setTasks] = useState<Task[]>([]);
   const [completionHistory, setCompletionHistory] = useState<CompletionEvent[]>([]);
+  const [motivation, setMotivation] = useState<MotivationState>(defaultMotivationState);
   const [themePreference, setThemePreference] = useState<ThemePreference>('system');
   const [tab, setTab] = useState<'tasks' | 'calendar' | 'statistics' | 'settings'>('tasks');
   const [statusFilter, setStatusFilter] = useState<TaskStatusFilter>('all');
@@ -364,13 +499,20 @@ export default function StillApp() {
   const [priorityDraft, setPriorityDraft] = useState<Priority>('medium');
   const [recurrenceDraft, setRecurrenceDraft] = useState<RecurrenceRule | null>(null);
   const [taskStorageWritable, setTaskStorageWritable] = useState(true);
+  const [motivationWritable, setMotivationWritable] = useState(true);
   const tasksDirty = useRef(false);
   const preservedTasks = useRef<unknown[]>([]);
   const persistQueue = useRef<Promise<void>>(Promise.resolve());
+  const motivationRef = useRef<MotivationState>(defaultMotivationState);
+  const completionInProgress = useRef(false);
+  const shopActionInProgress = useRef(false);
 
   const colorScheme = useColorScheme();
-  const effectiveTheme =
+  const baseTheme =
     themePreference === 'system' ? (colorScheme === 'dark' ? 'dark' : 'light') : themePreference;
+  const effectiveTheme =
+    motivation.selectedTheme === 'default' ? baseTheme : motivation.selectedTheme;
+  const isDarkTheme = effectiveTheme === 'dark' || effectiveTheme === 'midnight';
   const palette = palettes[effectiveTheme];
   const tomorrow = new Date();
   tomorrow.setDate(tomorrow.getDate() + 1);
@@ -387,10 +529,12 @@ export default function StillApp() {
   useEffect(() => {
     async function loadSavedData() {
       try {
+        await recoverProgressTransaction();
         const savedValues = await AsyncStorage.multiGet([
           TASKS_STORAGE_KEY,
           ONBOARDING_STORAGE_KEY,
           THEME_STORAGE_KEY,
+          MOTIVATION_STORAGE_KEY,
         ]);
         const saved = new Map(savedValues);
         setOnboarded(saved.get(ONBOARDING_STORAGE_KEY) === 'yes');
@@ -402,6 +546,25 @@ export default function StillApp() {
         setTasks(taskStore.tasks);
         setCompletionHistory(taskStore.completionHistory);
         preservedTasks.current = taskStore.preservedTasks ?? [];
+        const savedMotivation = saved.get(MOTIVATION_STORAGE_KEY) ?? null;
+        try {
+          const loadedMotivation = readMotivationState(savedMotivation);
+          motivationRef.current = loadedMotivation;
+          setMotivation(loadedMotivation);
+          if (savedMotivation === null) {
+            await AsyncStorage.setItem(
+              MOTIVATION_STORAGE_KEY,
+              JSON.stringify(loadedMotivation),
+            );
+          }
+        } catch (error) {
+          console.error('Still could not load or initialize motivation data.', error);
+          setMotivationWritable(false);
+          Alert.alert(
+            'Progress data unavailable',
+            'Still could not safely read or save your points and themes. Tasks remain available, but rewards and the shop are read-only until the data can be recovered.',
+          );
+        }
         if (preservedTasks.current.length) {
           Alert.alert(
             'Some saved tasks could not be shown',
@@ -554,71 +717,119 @@ export default function StillApp() {
     setModalVisible(false);
   }
 
-  function toggleTask(id: string) {
+  async function toggleTask(id: string) {
     if (!ensureTaskStorageWritable()) return;
+    if (completionInProgress.current) return;
     const task = tasks.find(item => item.id === id);
     if (!task) return;
+    completionInProgress.current = true;
+    let nextTasks: Task[];
+    let nextHistory = completionHistory;
+    let nextMotivation = motivationRef.current;
+    let completionEvent: CompletionEvent | null = null;
+    let duplicateOccurrence = false;
     if (task.completed) {
-      setTasks(current =>
-        current.map(item =>
-          item.id === id ? { ...item, completed: false, completedAt: null } : item,
-        ),
+      nextTasks = tasks.map(item =>
+        item.id === id ? { ...item, completed: false, completedAt: null } : item,
       );
     } else {
       const completedAt = new Date().toISOString();
-      const occurrenceDate = task.dueDate ?? today;
+      const completionDate = formatDate(new Date());
+      const occurrenceDate = task.dueDate;
       const recurring = task.recurrence !== null && task.recurrence !== undefined;
       const event: CompletionEvent = {
         id: recurring
-          ? `repeat:${task.id}:${occurrenceDate}`
+          ? `repeat:${task.id}:${occurrenceDate ?? completionDate}`
           : `once:${task.id}:${completedAt}:${Math.random().toString(36).slice(2)}`,
         taskId: task.id,
         title: task.title,
         occurrenceDate,
-        completionDate: today,
+        completionDate,
         completedAt,
         recurring,
       };
+      completionEvent = event;
       const recurrence = task.recurrence;
-      setCompletionHistory(current => {
-        if (
-          current.some(
-            item =>
-              item.id === event.id ||
-              (recurring &&
-                item.recurring &&
-                item.taskId === task.id &&
-                item.occurrenceDate === occurrenceDate),
-          )
-        ) {
-          return current;
-        }
-        return [...current, event];
-      });
+      duplicateOccurrence = completionHistory.some(
+        item =>
+          item.id === event.id ||
+          (recurring &&
+            item.recurring &&
+            item.taskId === task.id &&
+            item.occurrenceDate === occurrenceDate),
+      );
+      if (!duplicateOccurrence) nextHistory = [...completionHistory, event];
       if (recurrence) {
-        setTasks(current =>
-          current.map(item =>
-            item.id === id
-              ? {
-                  ...item,
-                  dueDate: nextOccurrenceDate(task.dueDate, recurrence, today),
-                  completed: false,
-                  completedAt: null,
-                }
-              : item,
-          ),
+        nextTasks = tasks.map(item =>
+          item.id === id
+            ? {
+                ...item,
+                dueDate: nextOccurrenceDate(task.dueDate, recurrence, completionDate),
+                completed: false,
+                completedAt: null,
+              }
+            : item,
         );
       } else {
-        setTasks(current =>
-          current.map(item =>
-            item.id === id
-              ? { ...item, completed: true, completedAt }
-              : item,
-          ),
+        nextTasks = tasks.map(item =>
+          item.id === id ? { ...item, completed: true, completedAt } : item,
         );
       }
     }
-    tasksDirty.current = true;
+
+    const nextStore: TaskStore = {
+      version: 2,
+      tasks: nextTasks,
+      completionHistory: nextHistory,
+      ...(preservedTasks.current.length
+        ? { preservedTasks: preservedTasks.current }
+        : {}),
+    };
+    const write = persistQueue.current.then(async () => {
+      if (
+        completionEvent &&
+        !duplicateOccurrence &&
+        motivationWritable
+      ) {
+        nextMotivation = rewardTaskCompletion(
+          motivationRef.current,
+          tasks,
+          completionHistory,
+          completionEvent,
+        );
+      } else {
+        nextMotivation = motivationRef.current;
+      }
+      const completionValues: [string, string][] = [
+        [TASKS_STORAGE_KEY, serializeTaskStore(nextStore)],
+      ];
+      if (motivationWritable) {
+        completionValues.push([
+          MOTIVATION_STORAGE_KEY,
+          JSON.stringify(nextMotivation),
+        ]);
+      }
+      await persistProgressTransaction(completionValues);
+    });
+    persistQueue.current = write.catch(error => {
+      console.error('Still could not save a task completion and its reward.', error);
+      Alert.alert(
+        'Could not save progress',
+        'The task and its reward were not applied. Please try again.',
+      );
+    });
+    try {
+      await write;
+      motivationRef.current = nextMotivation;
+      setMotivation(nextMotivation);
+      setTasks(nextTasks);
+      setCompletionHistory(nextHistory);
+      tasksDirty.current = false;
+    } catch {
+      return;
+    } finally {
+      completionInProgress.current = false;
+    }
   }
 
   function confirmDelete(task: Task) {
@@ -637,10 +848,111 @@ export default function StillApp() {
   }
 
   async function changeTheme(value: ThemePreference) {
-    if (!(await updatePreference(THEME_STORAGE_KEY, value, 'save your appearance setting'))) {
+    const write = persistQueue.current.then(async () => {
+      const nextMotivation = {
+        ...motivationRef.current,
+        selectedTheme: 'default' as const,
+      };
+      if (motivationWritable) {
+        await persistProgressTransaction([
+          [THEME_STORAGE_KEY, value],
+          [MOTIVATION_STORAGE_KEY, JSON.stringify(nextMotivation)],
+        ]);
+        motivationRef.current = nextMotivation;
+        setMotivation(nextMotivation);
+      } else {
+        await AsyncStorage.setItem(THEME_STORAGE_KEY, value);
+      }
+      setThemePreference(value);
+    });
+    persistQueue.current = write.catch(error => {
+      console.error('Still could not save your appearance setting.', error);
+      Alert.alert(
+        'Could not save changes',
+        'Your appearance setting was not changed. Please try again.',
+      );
+    });
+    try {
+      await write;
+    } catch {
       return;
     }
-    setThemePreference(value);
+  }
+
+  function requestShopTheme(theme: AppearanceTheme, cost: number) {
+    if (!motivationWritable) {
+      Alert.alert(
+        'Shop unavailable',
+        'Still could not safely read or save your points and theme ownership.',
+      );
+      return;
+    }
+    const current = motivationRef.current;
+    if (current.unlockedThemes.includes(theme)) {
+      void equipShopTheme(theme);
+      return;
+    }
+    if (current.sp < cost) {
+      Alert.alert(
+        'Not enough Still Points',
+        `You need ${cost - current.sp} more SP to unlock this theme.`,
+      );
+      return;
+    }
+    const name = rewardShopThemes.find(item => item.id === theme)?.name ?? theme;
+    Alert.alert(
+      `Unlock ${name}?`,
+      `Spend ${cost} SP to unlock this theme permanently?`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: `Unlock for ${cost} SP`,
+          onPress: () => void equipShopTheme(theme, cost),
+        },
+      ],
+    );
+  }
+
+  async function equipShopTheme(theme: AppearanceTheme, cost = 0) {
+    if (shopActionInProgress.current) return;
+    shopActionInProgress.current = true;
+    const write = persistQueue.current.then(async () => {
+      const current = motivationRef.current;
+      const alreadyOwned = current.unlockedThemes.includes(theme);
+      if (!alreadyOwned && current.sp < cost) {
+        throw new Error('Your SP balance has changed. Please try again.');
+      }
+      const nextMotivation: MotivationState = {
+        ...current,
+        sp: alreadyOwned ? current.sp : current.sp - cost,
+        unlockedThemes: alreadyOwned
+          ? current.unlockedThemes
+          : [...current.unlockedThemes, theme],
+        selectedTheme: theme,
+      };
+      await AsyncStorage.setItem(
+        MOTIVATION_STORAGE_KEY,
+        JSON.stringify(nextMotivation),
+      );
+      motivationRef.current = nextMotivation;
+      setMotivation(nextMotivation);
+    });
+    persistQueue.current = write.catch(error => {
+      console.error('Still could not save the theme unlock or selection.', error);
+      Alert.alert(
+        'Could not save theme',
+        error instanceof Error
+          ? error.message
+          : 'No points were spent. Please try again.',
+      );
+    });
+    try {
+      await write;
+    } catch {
+      return;
+    } finally {
+      shopActionInProgress.current = false;
+    }
   }
 
   function currentTaskStore(): TaskStore {
@@ -731,7 +1043,7 @@ export default function StillApp() {
         [ONBOARDING_STORAGE_KEY, backup.preferences.onboarded ? 'yes' : 'no'],
       );
     }
-    const write = persistQueue.current.then(() => AsyncStorage.multiSet(values));
+    const write = persistQueue.current.then(() => persistProgressTransaction(values));
     persistQueue.current = write.catch(error => {
       console.error('Still could not restore the backup.', error);
       Alert.alert(
@@ -878,7 +1190,7 @@ export default function StillApp() {
   if (!ready) {
     return (
       <SafeAreaView style={[styles.safeArea, { backgroundColor: palette.background }]}>
-        <StatusBar barStyle={effectiveTheme === 'dark' ? 'light-content' : 'dark-content'} />
+        <StatusBar barStyle={isDarkTheme ? 'light-content' : 'dark-content'} />
         <View style={styles.loading}>
           <Text style={[styles.wordmark, { color: palette.text }]}>{APP_NAME}</Text>
           <Text style={[styles.loadingCaption, { color: palette.secondary }]}>
@@ -893,7 +1205,7 @@ export default function StillApp() {
     const currentPage = pages[page];
     return (
       <SafeAreaView style={[styles.safeArea, { backgroundColor: palette.background }]}>
-        <StatusBar barStyle={effectiveTheme === 'dark' ? 'light-content' : 'dark-content'} />
+        <StatusBar barStyle={isDarkTheme ? 'light-content' : 'dark-content'} />
         <ScrollView
           contentContainerStyle={styles.onboardingScreen}
           showsVerticalScrollIndicator={false}
@@ -998,7 +1310,7 @@ export default function StillApp() {
 
   return (
     <SafeAreaView style={[styles.safeArea, { backgroundColor: palette.background }]}>
-      <StatusBar barStyle={effectiveTheme === 'dark' ? 'light-content' : 'dark-content'} />
+      <StatusBar barStyle={isDarkTheme ? 'light-content' : 'dark-content'} />
       <View style={styles.appScreen}>
         {tab === 'tasks' ? (
           <>
@@ -1297,13 +1609,18 @@ export default function StillApp() {
           <StatisticsScreen
             statistics={statistics}
             hasHistory={completionHistory.length > 0}
+            motivation={motivation}
+            motivationAvailable={motivationWritable}
             palette={palette}
           />
         ) : (
           <SettingsScreen
             palette={palette}
             themePreference={themePreference}
+            motivation={motivation}
+            motivationAvailable={motivationWritable}
             onThemeChange={changeTheme}
+            onSelectShopTheme={requestShopTheme}
             onReplayOnboarding={replayOnboarding}
             onExportBackup={() => void exportBackup()}
             onRestoreBackup={() => void pickBackupToRestore()}
@@ -1326,7 +1643,7 @@ export default function StillApp() {
             onPress={() => setTab('calendar')}
           />
           <TabButton
-            label="Stats"
+            label="Progress"
             mark="↗"
             selected={tab === 'statistics'}
             palette={palette}
@@ -1482,7 +1799,7 @@ function CalendarScreen({
     return day;
   });
   const events = completionHistory.filter(
-    event => event.occurrenceDate === selectedDate,
+    event => (event.occurrenceDate ?? event.completionDate) === selectedDate,
   );
   const eventTaskIds = new Set(events.map(event => event.taskId));
   const datedTasks = tasks.filter(
@@ -1665,12 +1982,25 @@ function CalendarScreen({
 function StatisticsScreen({
   statistics,
   hasHistory,
+  motivation,
+  motivationAvailable,
   palette,
 }: {
   statistics: ProductivityStatistics;
   hasHistory: boolean;
+  motivation: MotivationState;
+  motivationAvailable: boolean;
   palette: Palette;
 }) {
+  const level = getLevelProgress(motivation.xp);
+  const levelProgress =
+    level.nextLevelXp === null
+      ? 1
+      : Math.min(
+          1,
+          (motivation.xp - level.currentLevelXp) /
+            (level.nextLevelXp - level.currentLevelXp),
+        );
   return (
     <>
       <View style={[styles.topBar, { borderBottomColor: palette.border }]}>
@@ -1684,10 +2014,77 @@ function StatisticsScreen({
         <Text style={[styles.dateText, { color: palette.secondary }]}>
           YOUR PROGRESS
         </Text>
-        <Text style={[styles.pageTitle, { color: palette.text }]}>Statistics</Text>
+        <Text style={[styles.pageTitle, { color: palette.text }]}>Progress</Text>
         <Text style={[styles.pageSubtitle, { color: palette.secondary }]}>
-          A small, honest look at the work you have finished.
+          Your points, experience, and a simple look back.
         </Text>
+
+        <View
+          style={[
+            styles.motivationCard,
+            { backgroundColor: palette.surface, borderColor: palette.border },
+          ]}
+        >
+          <View style={styles.motivationTopRow}>
+            <View>
+              <Text style={[styles.progressLabel, { color: palette.secondary }]}>
+                STILL POINTS
+              </Text>
+              <Text style={[styles.motivationBalance, { color: palette.text }]}>
+                {motivationAvailable ? `${motivation.sp} SP` : 'Unavailable'}
+              </Text>
+            </View>
+            <View style={styles.motivationLevel}>
+              <Text style={[styles.progressLabel, { color: palette.secondary }]}>
+                LEVEL {level.level}
+              </Text>
+              <Text style={[styles.settingTitle, { color: palette.text }]}>
+                {level.name}
+              </Text>
+            </View>
+          </View>
+          <View style={styles.motivationXpHeader}>
+            <Text style={[styles.settingDescription, { color: palette.secondary }]}>
+              {motivation.xp} lifetime XP
+            </Text>
+            <Text style={[styles.settingDescription, { color: palette.secondary }]}>
+              {level.nextLevelXp === null
+                ? 'Max level'
+                : `${Math.max(0, level.nextLevelXp - motivation.xp)} XP to next level`}
+            </Text>
+          </View>
+          <View
+            accessibilityRole="progressbar"
+            accessibilityLabel={
+              level.nextLevelXp === null
+                ? 'Maximum level reached'
+                : `Level ${level.level} experience progress`
+            }
+            accessibilityValue={{ min: 0, max: 100, now: Math.round(levelProgress * 100) }}
+            style={[styles.progressTrack, { backgroundColor: palette.track }]}
+          >
+            <View
+              style={[
+                styles.progressFill,
+                {
+                  width: `${Math.round(levelProgress * 100)}%`,
+                  backgroundColor: palette.strong,
+                },
+              ]}
+            />
+          </View>
+          <Text style={[styles.statisticsFootnote, { color: palette.secondary }]}>
+            Each new task occurrence earns 10 SP and 10 XP. First completion each day
+            adds 5 SP; completing that day’s scheduled tasks adds 10 SP. The schedule
+            locks at your first completion.
+          </Text>
+          {!motivationAvailable && (
+            <Text style={[styles.statisticsFootnote, { color: palette.secondary }]}>
+              Progress data could not be read safely. Tasks remain available, but rewards
+              and theme unlocks are paused.
+            </Text>
+          )}
+        </View>
 
         {!hasHistory && (
           <View style={[styles.statisticsEmpty, { borderColor: palette.border }]}>
@@ -1808,14 +2205,20 @@ function TabButton({
 function SettingsScreen({
   palette,
   themePreference,
+  motivation,
+  motivationAvailable,
   onThemeChange,
+  onSelectShopTheme,
   onReplayOnboarding,
   onExportBackup,
   onRestoreBackup,
 }: {
   palette: Palette;
   themePreference: ThemePreference;
+  motivation: MotivationState;
+  motivationAvailable: boolean;
   onThemeChange: (value: ThemePreference) => void;
+  onSelectShopTheme: (theme: AppearanceTheme, cost: number) => void;
   onReplayOnboarding: () => void;
   onExportBackup: () => void;
   onRestoreBackup: () => void;
@@ -1870,6 +2273,62 @@ function SettingsScreen({
             </Pressable>
           ))}
         </View>
+      </View>
+
+      <Text style={[styles.settingsSectionLabel, { color: palette.secondary }]}>
+        REWARDS SHOP
+      </Text>
+      <View style={[styles.settingsGroup, { borderColor: palette.border }]}>
+        <Text style={[styles.shopBalance, { color: palette.text }]}>
+          {motivationAvailable ? `${motivation.sp} SP available` : 'Shop temporarily unavailable'}
+        </Text>
+        <Text style={[styles.settingDescription, { color: palette.secondary }]}>
+          Unlock themes once, then switch between them freely.
+        </Text>
+        {rewardShopThemes.map((theme, index) => {
+          const owned = motivation.unlockedThemes.includes(theme.id);
+          const equipped = motivation.selectedTheme === theme.id;
+          const affordable = motivation.sp >= theme.cost;
+          const stateLabel = equipped
+            ? 'Equipped'
+            : owned
+              ? 'Owned · tap to equip'
+              : affordable
+                ? `Locked · ${theme.cost} SP`
+                : `Locked · not enough points · ${theme.cost} SP`;
+          return (
+            <React.Fragment key={theme.id}>
+              {index > 0 && (
+                <View style={[styles.settingsDivider, { backgroundColor: palette.border }]} />
+              )}
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel={`${theme.name}. ${stateLabel}`}
+                accessibilityState={{ selected: equipped, disabled: !motivationAvailable }}
+                disabled={!motivationAvailable}
+                onPress={() => onSelectShopTheme(theme.id, theme.cost)}
+                style={styles.shopThemeRow}
+              >
+                <View style={styles.shopThemeCopy}>
+                  <Text style={[styles.settingTitle, { color: palette.text }]}>
+                    {theme.name}
+                  </Text>
+                  <Text style={[styles.settingDescription, { color: palette.secondary }]}>
+                    {theme.description}
+                  </Text>
+                </View>
+                <Text
+                  style={[
+                    styles.shopThemeState,
+                    { color: equipped || owned ? palette.text : palette.secondary },
+                  ]}
+                >
+                  {stateLabel}
+                </Text>
+              </Pressable>
+            </React.Fragment>
+          );
+        })}
       </View>
 
       <Text style={[styles.settingsSectionLabel, { color: palette.secondary }]}>
@@ -2365,6 +2824,11 @@ const styles = {
   progressCardTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 11 },
   progressLabel: { fontSize: 9, letterSpacing: 1.5, fontWeight: '600' },
   progressValue: { fontSize: 12, fontWeight: '600' },
+  motivationCard: { borderWidth: 1, borderRadius: 10, padding: 15, marginBottom: 14 },
+  motivationTopRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  motivationBalance: { fontSize: 25, lineHeight: 31, fontWeight: '600', marginTop: 3 },
+  motivationLevel: { alignItems: 'flex-end' },
+  motivationXpHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 12, marginBottom: 8 },
   progressTrack: { height: 4, borderRadius: 2, overflow: 'hidden' },
   progressFill: { height: 4, borderRadius: 2 },
   widgetPreview: { borderWidth: 1, borderRadius: 10, padding: 13, marginBottom: 12 },
@@ -2496,6 +2960,10 @@ const styles = {
   settingsContent: { paddingHorizontal: 23, paddingTop: 34, paddingBottom: 35 },
   settingsSectionLabel: { fontSize: 9, fontWeight: '600', letterSpacing: 1.6, marginTop: 27, marginBottom: 10 },
   settingsGroup: { borderWidth: 1, borderRadius: 10, padding: 15 },
+  shopBalance: { fontSize: 17, fontWeight: '600' },
+  shopThemeRow: { minHeight: 64, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 12 },
+  shopThemeCopy: { flex: 1 },
+  shopThemeState: { maxWidth: 135, fontSize: 11, lineHeight: 16, textAlign: 'right', fontWeight: '500' },
   settingTitle: { fontSize: 14, fontWeight: '600' },
   settingDescription: { fontSize: 12, marginTop: 5, lineHeight: 18 },
   themeOptions: { flexDirection: 'row', gap: 7, marginTop: 14 },
